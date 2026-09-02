@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <set>
 #include <type_traits>
 #include <unordered_set>
@@ -903,8 +905,20 @@ public:
 
         version = model_loader.get_sd_version();
         if (version == VERSION_COUNT) {
-            LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
-            return false;
+            // VAE-only contexts (standalone decoders): no diffusion model to detect a
+            // version from, so honor an explicit override. Version only selects the VAE
+            // class/scaling here; nothing else runs without a diffusion model anyway.
+            if (strlen(SAFE_STR(sd_ctx_params->model_path)) == 0 &&
+                strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) == 0 &&
+                sd_ctx_params->force_model_version >= 0 &&
+                sd_ctx_params->force_model_version < VERSION_COUNT) {
+                version = static_cast<SDVersion>(sd_ctx_params->force_model_version);
+                LOG_WARN("no diffusion model loaded; assuming version %s for VAE-only context",
+                         model_version_to_str[version]);
+            } else {
+                LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+                return false;
+            }
         } else {
             LOG_INFO("Version: %s ", model_version_to_str[version]);
         }
@@ -1690,7 +1704,13 @@ public:
         }
 
         model_manager->set_common_ignore_tensors(ignore_tensors);
-        if (!model_manager->validate_registered_tensors()) {
+        // VAE-only contexts (standalone decoders): no diffusion/conditioner files were
+        // loaded, so their architecture-driven expected tensors can never match metadata.
+        // The validation exists to catch mismatched diffusion checkpoints — skip it when
+        // there is no diffusion model to validate.
+        const bool vae_only_ctx = strlen(SAFE_STR(sd_ctx_params->model_path)) == 0 &&
+                                  strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) == 0;
+        if (!vae_only_ctx && !model_manager->validate_registered_tensors()) {
             LOG_ERROR("model metadata validation failed");
             return false;
         }
@@ -3583,6 +3603,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->rpc_servers          = nullptr;
     sd_ctx_params->model_args           = nullptr;
     sd_ctx_params->pulid_weights_path   = nullptr;
+    sd_ctx_params->force_model_version  = -1;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -3740,6 +3761,8 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     sd_img_gen_params->qwen_image_layers   = 3;
     sd_img_gen_params->circular_x          = false;
     sd_img_gen_params->circular_y          = false;
+    sd_img_gen_params->latent_output_path  = nullptr;
+    sd_img_gen_params->latent_input_path   = nullptr;
     sd_img_gen_params->pm_params           = {nullptr, 0, nullptr, 20.f};
     sd_img_gen_params->pulid_params        = {nullptr, 1.0f};
     sd_img_gen_params->vae_tiling_params   = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -3816,6 +3839,10 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              get_cache_reuse_threshold(sd_img_gen_params->cache),
              sd_img_gen_params->cache.start_percent,
              sd_img_gen_params->cache.end_percent);
+    snprintf(buf + strlen(buf), 4096 - strlen(buf),
+             "latent_output_path: %s\nlatent_input_path: %s\n",
+             SAFE_STR(sd_img_gen_params->latent_output_path),
+             SAFE_STR(sd_img_gen_params->latent_input_path));
     free(sample_params_str);
     return buf;
 }
@@ -3880,6 +3907,89 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         return nullptr;
     }
     return sd_ctx;
+}
+
+// ---- VAE-only helpers (standalone decoder) ----
+
+SD_API int sd_version_from_str(const char* name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    for (int i = 0; i < VERSION_COUNT; i++) {
+        if (strcmp(name, model_version_to_str[i]) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+SD_API const char* sd_version_to_str(int version) {
+    if (version < 0 || version >= VERSION_COUNT) {
+        return "";
+    }
+    return model_version_to_str[version];
+}
+
+SD_API int sd_ctx_get_vae_latent_channels(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->model_manager == nullptr) {
+        return 0;
+    }
+    // FLUX.2's AE is special: the diffusion latent is 128 channels (decoded via a
+    // per-channel mean/std table in the VAE), not the post_quant_conv z-dim.
+    if (sd_version_uses_flux2_vae(sd_ctx->sd->version)) {
+        return 128;
+    }
+    // Generic KL-style AEs: z-channels = input channels of the decoder's first conv
+    // (or post_quant_conv). ggml conv weight ne = {kh, kw, in, out} -> in is ne[2].
+    const auto& map = sd_ctx->sd->model_manager->loader().get_tensor_storage_map();
+    int channels    = 0;
+    for (const auto& kv : map) {
+        const std::string& key  = kv.first;
+        const TensorStorage& ts = kv.second;
+        if (ts.ne[2] <= 1) {
+            continue;
+        }
+        if (key.find("decoder.conv_in") != std::string::npos) {
+            channels = static_cast<int>(ts.ne[2]);
+            break;
+        }
+        if (channels == 0 && key.find("post_quant_conv") != std::string::npos) {
+            channels = static_cast<int>(ts.ne[2]);
+        }
+    }
+    return channels;
+}
+
+SD_API sd_image_t sd_decode_latent(sd_ctx_t* sd_ctx,
+                                   const float* latent_data,
+                                   const int64_t* latent_shape,
+                                   int ndim) {
+    sd_image_t empty = {0, 0, 0, nullptr};
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->first_stage_model == nullptr) {
+        LOG_ERROR("sd_decode_latent: context has no VAE loaded");
+        return empty;
+    }
+    if (latent_data == nullptr || latent_shape == nullptr || ndim <= 0 || ndim > 4) {
+        LOG_ERROR("sd_decode_latent: invalid latent arguments");
+        return empty;
+    }
+    std::vector<int64_t> shape(latent_shape, latent_shape + ndim);
+    int64_t nelem = 1;
+    for (int64_t d : shape) {
+        if (d <= 0) {
+            LOG_ERROR("sd_decode_latent: invalid shape");
+            return empty;
+        }
+        nelem *= d;
+    }
+    std::vector<float> data(latent_data, latent_data + nelem);
+    sd::Tensor<float> latent(std::move(shape), std::move(data));
+    sd::Tensor<float> decoded = sd_ctx->sd->decode_first_stage(latent);
+    if (decoded.empty()) {
+        LOG_ERROR("sd_decode_latent: VAE decode failed");
+        return empty;
+    }
+    return tensor_to_sd_image(decoded);
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
@@ -4095,6 +4205,8 @@ struct GenerationRequest {
     int requested_frames                     = -1;
     int fps                                  = 16;
     float vace_strength                      = 1.f;
+    std::string latent_output_path;  // --serialize-latent destination (.lat), empty = off
+    std::string latent_input_path;   // --latent-file: decode-only input, empty = normal gen
 
     GenerationRequest(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
         prompt                      = SAFE_STR(sd_img_gen_params->prompt);
@@ -4117,6 +4229,8 @@ struct GenerationRequest {
         pulid_params                = sd_img_gen_params->pulid_params;
         hires                       = sd_img_gen_params->hires;
         cache_params                = &sd_img_gen_params->cache;
+        latent_output_path          = SAFE_STR(sd_img_gen_params->latent_output_path);
+        latent_input_path           = SAFE_STR(sd_img_gen_params->latent_input_path);
         resolve(sd_ctx);
     }
 
@@ -5324,6 +5438,130 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     return embeds;
 }
 
+// ---- .lat raw-latent serialization (--serialize-latent / --latent-file) ----
+// Format (host byte order, little-endian on x64), 44-byte header + raw f32 data:
+//   magic[4] = "SDLT" | u32 version = 2 | u32 dtype = 0 (f32)
+//   | u32 ndim (<=4) | u32 dims[4] (zero-padded, sd::Tensor shape order)
+//   | u64 nbytes (payload bytes) | u32 model_version (SDVersion of the producer)
+// v1 files (40-byte header, no model_version) are still readable; their
+// model_version is reported as VERSION_COUNT (unknown).
+// The payload is the exact contiguous tensor bytes decode_first_stage consumes,
+// so a round trip (.lat -> decode-only) reproduces the image byte-for-byte.
+static int64_t tensor_nelem(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) {
+        n *= d;
+    }
+    return n;
+}
+
+static bool write_latent_file(const std::string& path, const sd::Tensor<float>& t, int model_version) {
+    const std::vector<int64_t>& shape = t.shape();
+    if (shape.empty() || shape.size() > 4) {
+        LOG_ERROR("write_latent_file: unsupported latent rank %zu", shape.size());
+        return false;
+    }
+    const int64_t nelem = tensor_nelem(shape);
+    if (nelem <= 0) {
+        LOG_ERROR("write_latent_file: empty latent");
+        return false;
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        LOG_ERROR("write_latent_file: cannot open '%s' for writing", path.c_str());
+        return false;
+    }
+    bool ok = false;
+    do {
+        uint32_t dims[4] = {0, 0, 0, 0};
+        for (size_t i = 0; i < shape.size(); i++) {
+            dims[i] = static_cast<uint32_t>(shape[i]);
+        }
+        const uint64_t nbytes = static_cast<uint64_t>(nelem) * sizeof(float);
+        if (fwrite("SDLT", 1, 4, f) != 4) break;
+        const uint32_t version = 2, dtype = 0, ndim = static_cast<uint32_t>(shape.size());
+        if (fwrite(&version, sizeof(version), 1, f) != 1) break;
+        if (fwrite(&dtype, sizeof(dtype), 1, f) != 1) break;
+        if (fwrite(&ndim, sizeof(ndim), 1, f) != 1) break;
+        if (fwrite(dims, sizeof(dims), 1, f) != 1) break;
+        if (fwrite(&nbytes, sizeof(nbytes), 1, f) != 1) break;
+        const uint32_t mv = static_cast<uint32_t>(model_version >= 0 ? model_version : VERSION_COUNT);
+        if (fwrite(&mv, sizeof(mv), 1, f) != 1) break;
+        if (fwrite(t.data(), sizeof(float), static_cast<size_t>(nelem), f) != static_cast<size_t>(nelem)) break;
+        ok = true;
+    } while (0);
+    fclose(f);
+    if (!ok) {
+        LOG_ERROR("write_latent_file: failed writing '%s'", path.c_str());
+        std::remove(path.c_str());
+    }
+    return ok;
+}
+
+static bool read_latent_file(const std::string& path,
+                             std::vector<sd::Tensor<float>>& out,
+                             int* model_version_out = nullptr) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        LOG_ERROR("read_latent_file: cannot open '%s'", path.c_str());
+        return false;
+    }
+    bool ok = false;
+    do {
+        char magic[4] = {0};
+        uint32_t version = 0, dtype = 0, ndim = 0, dims[4] = {0, 0, 0, 0};
+        uint64_t nbytes = 0;
+        int model_version = VERSION_COUNT;
+        if (fread(magic, 1, 4, f) != 4) break;
+        if (memcmp(magic, "SDLT", 4) != 0) {
+            LOG_ERROR("read_latent_file: '%s' is not a .lat file (bad magic)", path.c_str());
+            break;
+        }
+        if (fread(&version, sizeof(version), 1, f) != 1) break;
+        if (fread(&dtype, sizeof(dtype), 1, f) != 1) break;
+        if (fread(&ndim, sizeof(ndim), 1, f) != 1) break;
+        if (fread(dims, sizeof(dims), 1, f) != 1) break;
+        if (fread(&nbytes, sizeof(nbytes), 1, f) != 1) break;
+        if (version == 2) {
+            uint32_t mv = 0;
+            if (fread(&mv, sizeof(mv), 1, f) != 1) break;
+            model_version = static_cast<int>(mv);
+        } else if (version != 1) {
+            LOG_ERROR("read_latent_file: unsupported .lat version %u", version);
+            break;
+        }
+        if (dtype != 0 || ndim == 0 || ndim > 4) {
+            LOG_ERROR("read_latent_file: unsupported header (version=%u dtype=%u ndim=%u)",
+                      version, dtype, ndim);
+            break;
+        }
+        std::vector<int64_t> shape;
+        int64_t nelem = 1;
+        for (uint32_t i = 0; i < ndim; i++) {
+            shape.push_back(static_cast<int64_t>(dims[i]));
+            nelem *= static_cast<int64_t>(dims[i]);
+        }
+        if (nbytes != static_cast<uint64_t>(nelem) * sizeof(float) || nelem <= 0) {
+            LOG_ERROR("read_latent_file: size mismatch (%llu bytes vs %lld elements)",
+                      (unsigned long long)nbytes, (long long)nelem);
+            break;
+        }
+        std::vector<float> data(static_cast<size_t>(nelem));
+        if (fread(data.data(), sizeof(float), static_cast<size_t>(nelem), f) != static_cast<size_t>(nelem)) {
+            LOG_ERROR("read_latent_file: short read on '%s'", path.c_str());
+            break;
+        }
+        if (model_version_out != nullptr) {
+            *model_version_out = model_version;
+        }
+        out.clear();
+        out.emplace_back(std::move(shape), std::move(data));
+        ok = true;
+    } while (0);
+    fclose(f);
+    return ok;
+}
+
 static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
                                         const GenerationRequest& request,
                                         const std::vector<sd::Tensor<float>>& final_latents,
@@ -5351,6 +5589,24 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
             cancelled = true;
             break;
         }
+
+        // --serialize-latent: dump the raw latent to a .lat file BEFORE it enters the VAE decoder.
+        if (!request.latent_output_path.empty()) {
+            std::string lpath = request.latent_output_path;
+            if (final_latents.size() > 1) {
+                const size_t dot = lpath.rfind(".lat");
+                if (dot != std::string::npos) {
+                    lpath.erase(dot);
+                }
+                lpath += "_" + std::to_string(i) + ".lat";
+            }
+            if (write_latent_file(lpath, final_latents[i], static_cast<int>(sd_ctx->sd->version))) {
+                LOG_INFO("latent %zu serialized to '%s' before VAE decode", i + 1, lpath.c_str());
+            } else {
+                LOG_ERROR("failed to serialize latent %zu to '%s'", i + 1, lpath.c_str());
+            }
+        }
+
         int64_t t1 = ggml_time_ms();
         if (sd_ctx->sd->version == VERSION_QWEN_IMAGE_LAYERED) {
             int qwen_image_latent_layers = request.qwen_image_layers + 1;
@@ -5647,6 +5903,34 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
     GenerationRequest request(sd_ctx, sd_img_gen_params);
     LOG_INFO("generate_image %dx%d", request.width, request.height);
+
+    // --latent-file: decode-only mode. Skip diffusion (no seeds, embeds, sampling or
+    // hires) and feed the .lat straight into the VAE decoder. Lazy loading means the
+    // diffusion model tensors never materialize, so only the VAE does real work.
+    if (!request.latent_input_path.empty()) {
+        std::vector<sd::Tensor<float>> final_latents;
+        if (!read_latent_file(request.latent_input_path, final_latents) || final_latents.empty()) {
+            LOG_ERROR("failed to load latent file '%s'", request.latent_input_path.c_str());
+            return false;
+        }
+        LOG_INFO("decode-only: loaded %zu latent from '%s'",
+                 final_latents.size(), request.latent_input_path.c_str());
+        int num_images = 0;
+        auto result    = decode_image_outputs(sd_ctx, request, final_latents, &num_images);
+        if (result == nullptr) {
+            return false;
+        }
+        sd_ctx->sd->lora_stat();
+        if (num_images_out != nullptr) {
+            *num_images_out = num_images;
+        }
+        if (images_out != nullptr) {
+            *images_out = result;
+        } else {
+            free_sd_images(result, num_images);
+        }
+        return true;
+    }
 
     sd_ctx->sd->rng->manual_seed(request.seed);
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);

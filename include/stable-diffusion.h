@@ -238,6 +238,7 @@ typedef struct {
     bool auto_fit;
     const char* rpc_servers;
     const char* model_args;
+    int force_model_version;  // VAE-only contexts: SDVersion to assume when no diffusion model is loaded (-1 = auto/fail)
 } sd_ctx_params_t;
 
 typedef struct {
@@ -401,6 +402,8 @@ typedef struct {
     int qwen_image_layers;
     bool circular_x;
     bool circular_y;
+    const char* latent_output_path;  // --serialize-latent: dump the raw latent (.lat) before VAE decode
+    const char* latent_input_path;   // --latent-file: decode-only mode, feed a .lat straight to the VAE
 } sd_img_gen_params_t;
 
 typedef struct {
@@ -485,6 +488,20 @@ SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
 
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
+
+// VAE-only helpers for standalone decoders (sd-decoder etc.).
+// Returns the SDVersion enum value for a model family name ("flux2", "sdxl", ...) or -1.
+SD_API int sd_version_from_str(const char* name);
+// Returns the model family name for an SDVersion enum value ("" if out of range).
+SD_API const char* sd_version_to_str(int version);
+// Latent z-channels of the loaded VAE (from its weights), 0 if unknown.
+SD_API int sd_ctx_get_vae_latent_channels(sd_ctx_t* sd_ctx);
+// Decode one latent tensor (raw f32, shape in sd::Tensor order, ndim <= 4) to an image.
+// Returns a zeroed image on failure (width == 0). Caller frees data with free().
+SD_API sd_image_t sd_decode_latent(sd_ctx_t* sd_ctx,
+                                   const float* latent_data,
+                                   const int64_t* latent_shape,
+                                   int ndim);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 SD_API void free_sd_audio(sd_audio_t* audio);
 

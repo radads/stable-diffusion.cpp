@@ -1021,6 +1021,11 @@ ArgOptions SDGenerationParams::get_options() {
          "Key-value list to set up the way the reference images are processed (empty = auto-detect from model weigths)",
          (int)',',
          &ref_image_args},
+        {"",
+         "--latent-file",
+         "decode-only mode: feed a saved .lat latent straight to the VAE decoder and skip diffusion entirely",
+         0,
+         &latent_input_path},
     };
 
     options.int_options = {
@@ -1238,6 +1243,11 @@ ArgOptions SDGenerationParams::get_options() {
          "enable highres fix",
          true,
          &hires_enabled},
+        {"",
+         "--serialize-latent",
+         "dump the raw latent to a .lat file before the VAE decoder (default path: <output>.lat)",
+         true,
+         &serialize_latent},
     };
 
     auto on_seed_arg = [&](int argc, const char** argv, int index) {
@@ -2595,6 +2605,8 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
+    params.latent_output_path        = latent_output_path.empty() ? nullptr : latent_output_path.c_str();
+    params.latent_input_path         = latent_input_path.empty() ? nullptr : latent_input_path.c_str();
     return params;
 }
 

@@ -650,6 +650,28 @@ int main(int argc, const char* argv[]) {
     SDGenerationParams gen_params;
 
     parse_args(argc, argv, cli_params, ctx_params, gen_params);
+
+    // --serialize-latent: derive the .lat destination from the output path.
+    if (gen_params.serialize_latent) {
+        if (cli_params.mode != IMG_GEN && cli_params.mode != ADETAILER) {
+            LOG_ERROR("--serialize-latent is only supported in image generation mode");
+            return 1;
+        }
+        if (std::regex_search(cli_params.output_path, format_specifier_regex)) {
+            LOG_ERROR("--serialize-latent is not supported with batch output name patterns (%%d); use a single output path");
+            return 1;
+        }
+        fs::path latent_path = cli_params.output_path;
+        latent_path.replace_extension(".lat");
+        gen_params.latent_output_path = latent_path.string();
+        LOG_INFO("--serialize-latent enabled: latent will be saved to '%s' before VAE decode",
+                 gen_params.latent_output_path.c_str());
+    }
+    if (!gen_params.latent_input_path.empty() && cli_params.mode != IMG_GEN) {
+        LOG_ERROR("--latent-file (decode-only) is only supported in image generation mode");
+        return 1;
+    }
+
     sd_set_log_callback(sd_log_cb, (void*)&cli_params);
     log_verbose = cli_params.verbose;
     log_color   = cli_params.color;

@@ -255,6 +255,11 @@ struct SDGenerationParams {
     bool circular_x = false;
     bool circular_y = false;
 
+    // --serialize-latent destination (.lat) and --latent-file decode-only input.
+    std::string latent_output_path;
+    std::string latent_input_path;
+    bool serialize_latent = false;
+
     bool hires_enabled         = false;
     std::string hires_upscaler = "Latent";
     std::string hires_upscaler_model_path;
