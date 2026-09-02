@@ -16,16 +16,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
 
+#if SD_DECODER_HAS_GLFW
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#include <glad/gl.h>
+#else
 #ifdef _WIN32
 #include <conio.h>
 #include <windows.h>
 #else
 #include <sys/select.h>
 #include <unistd.h>
+#endif
 #endif
 
 #include "stable-diffusion.h"
@@ -72,9 +79,10 @@ static void print_usage(const char* argv0) {
             "  --amp S               target per-channel std after blur + renormalize (default 3.0).\n"
             "                        Higher values push the decoder harder -> saturated, dreamier colors\n"
             "                        (--blur 0 --amp 1.0 reproduces the old pure-static look)\n"
-            "  --loop                interactive random mode: VAE loads once, any keypress generates a\n"
-            "                        new dream image and overwrites the output file; Ctrl-C quits.\n"
-            "                        (run directly in a terminal on the machine - needs a console)\n"
+            "  --loop                interactive random mode: opens a GLFW window sized to the\n"
+            "                        output (-W/-H, default 512x512). VAE loads once; SPACE = one\n"
+            "                        dream, P = continuous autoplay (title shows decode throughput\n"
+            "                        in img/s), ESC = quit. No file output in window mode\n"
             "  --iterations N        bounded loop: generate N dream images back-to-back then exit\n",
             argv0);
 }
@@ -143,6 +151,266 @@ static void log_cb(enum sd_log_level_t level, const char* log, void* data) {
     (void)data;
     fputs(log, stderr);
 }
+
+#if SD_DECODER_HAS_GLFW
+// ---- GLFW dream window (--loop) ----
+// The VAE stays loaded. SPACE decodes one random dream and draws it as a
+// fullscreen texture; P toggles continuous autoplay (title shows decode
+// throughput in img/s over a rolling 2s window); ESC quits.
+static std::atomic<bool> g_glfw_regen{false};
+static std::atomic<bool> g_glfw_autoplay{false};  // P: continuous generation
+
+static void glfw_key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/) {
+    if (action != GLFW_PRESS) {
+        return;
+    }
+    switch (key) {
+        case GLFW_KEY_ESCAPE:
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+            break;
+        case GLFW_KEY_SPACE:
+            g_glfw_regen.store(true);  // one dream per press
+            break;
+        case GLFW_KEY_P:
+            g_glfw_autoplay.store(!g_glfw_autoplay.load());
+            if (g_glfw_autoplay.load()) {
+                g_glfw_regen.store(true);  // start immediately
+                fprintf(stderr, "sd-decoder: autoplay ON (P to stop)\n");
+            } else {
+                fprintf(stderr, "sd-decoder: autoplay OFF - SPACE for single dreams\n");
+            }
+            break;
+        default:
+            break;  // other keys ignored
+    }
+}
+
+static void glfw_framebuffer_size_callback(GLFWwindow* /*window*/, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+
+// ---- textured fullscreen quad (LearnOpenGL 4.1 style, adapted to fullscreen) ----
+
+static const char* k_vertex_shader_src = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTexCoord;
+out vec2 TexCoord;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    TexCoord = aTexCoord;
+}
+)";
+
+static const char* k_fragment_shader_src = R"(
+#version 330 core
+in vec2 TexCoord;
+out vec4 FragColor;
+uniform sampler2D ourTexture;
+void main() {
+    FragColor = texture(ourTexture, TexCoord);
+}
+)";
+
+static GLuint s_quad_vao = 0;
+static GLuint s_quad_vbo = 0;
+static GLuint s_tex     = 0;
+static GLuint s_prog    = 0;
+
+static bool gl_log_shader(GLuint shader, const char* name) {
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (ok) {
+        return true;
+    }
+    char log[1024];
+    glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+    fprintf(stderr, "sd-decoder: %s shader compile error:\n%s\n", name, log);
+    return false;
+}
+
+static bool init_texture_quad() {
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &k_vertex_shader_src, nullptr);
+    glCompileShader(vs);
+    if (!gl_log_shader(vs, "vertex")) return false;
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &k_fragment_shader_src, nullptr);
+    glCompileShader(fs);
+    if (!gl_log_shader(fs, "fragment")) return false;
+
+    s_prog = glCreateProgram();
+    glAttachShader(s_prog, vs);
+    glAttachShader(s_prog, fs);
+    glLinkProgram(s_prog);
+    GLint ok = 0;
+    glGetProgramiv(s_prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(s_prog, sizeof(log), nullptr, log);
+        fprintf(stderr, "sd-decoder: program link error:\n%s\n", log);
+        return false;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    // Fullscreen quad (two triangles covering NDC [-1,1]). Texcoord v is flipped
+    // (v=0 at the TOP of the screen) because the decoded image rows are top-down
+    // while OpenGL textures start at v=0 on the bottom row.
+    const float quad[] = {
+        // positions      // texcoords
+        -1.0f, -1.0f,     0.0f, 1.0f,
+         1.0f, -1.0f,     1.0f, 1.0f,
+         1.0f,  1.0f,     1.0f, 0.0f,
+         1.0f,  1.0f,     1.0f, 0.0f,
+        -1.0f,  1.0f,     0.0f, 0.0f,
+        -1.0f, -1.0f,     0.0f, 1.0f,
+    };
+    glGenVertexArrays(1, &s_quad_vao);
+    glGenBuffers(1, &s_quad_vbo);
+    glBindVertexArray(s_quad_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s_quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glGenTextures(1, &s_tex);
+    glBindTexture(GL_TEXTURE_2D, s_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // 1x1 placeholder until the first generation lands.
+    const unsigned char black[3] = {0, 0, 0};
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, black);
+    glUseProgram(s_prog);
+    glUniform1i(glGetUniformLocation(s_prog, "ourTexture"), 0);
+    return true;
+}
+
+static void upload_image_to_texture(const sd_image_t& image) {
+    glBindTexture(GL_TEXTURE_2D, s_tex);
+    const GLenum fmt  = image.channel == 4 ? GL_RGBA : GL_RGB;
+    const GLint  ifmt = image.channel == 4 ? GL_RGBA8 : GL_RGB8;
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt,
+                 static_cast<GLsizei>(image.width), static_cast<GLsizei>(image.height),
+                 0, fmt, GL_UNSIGNED_BYTE, image.data);
+}
+
+static int glfw_dream_loop(int window_width,
+                           int window_height,
+                           uint64_t fixed_seed,
+                           const std::function<void(uint64_t)>& build_random,
+                           const std::function<sd_image_t()>& decode_only) {
+    if (!glfwInit()) {
+        fprintf(stderr, "sd-decoder: glfwInit failed (no display session?)\n");
+        return 1;
+    }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    char title[128];
+    snprintf(title, sizeof(title), "sd-decoder dream %dx%d", window_width, window_height);
+    GLFWwindow* window = glfwCreateWindow(window_width, window_height, title, nullptr, nullptr);
+    if (window == nullptr) {
+        fprintf(stderr, "sd-decoder: failed to create GLFW window\n");
+        glfwTerminate();
+        return 1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, glfw_framebuffer_size_callback);
+    glfwSetKeyCallback(window, glfw_key_callback);
+
+    if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) {
+        fprintf(stderr, "sd-decoder: failed to initialize GLAD\n");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
+    glViewport(0, 0, window_width, window_height);
+    glfwSwapInterval(1);
+
+    if (!init_texture_quad()) {
+        fprintf(stderr, "sd-decoder: GL setup failed\n");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
+
+    g_glfw_regen.store(false);
+    g_glfw_autoplay.store(false);
+    fprintf(stderr,
+            "sd-decoder: dream window open (%dx%d)\n"
+            "  SPACE = one dream    P = autoplay (toggle)    ESC = quit\n",
+            window_width, window_height);
+
+    uint64_t iteration   = 0;
+    double fps_window_t  = glfwGetTime();
+    uint64_t fps_count   = 0;
+    char fps_title[192];
+    while (!glfwWindowShouldClose(window) && !g_quit_interactive.load()) {
+        glfwPollEvents();
+
+        // Generate when a SPACE press is pending, or continuously in autoplay.
+        const bool want_gen = g_glfw_regen.exchange(false) || g_glfw_autoplay.load();
+        if (want_gen) {
+            iteration++;
+            uint64_t seed = fixed_seed;
+            if (seed != 0) {
+                seed += iteration - 1;
+            } else {
+                std::random_device rd;
+                seed = ((uint64_t)rd() << 32) ^ rd() ^ (uint64_t)time(nullptr) ^ (uint64_t)(uintptr_t)window;
+            }
+            fprintf(stderr, "sd-decoder: iteration %llu\n", (unsigned long long)iteration);
+            build_random(seed);
+
+            sd_image_t image = decode_only();
+            if (image.width == 0 || image.data == nullptr) {
+                fprintf(stderr, "sd-decoder: VAE decode failed\n");
+                break;
+            }
+            upload_image_to_texture(image);
+            free(image.data);
+            fps_count++;
+        }
+
+        // Throughput sample: generations per second over a rolling ~2s window,
+        // shown in the window title.
+        const double now = glfwGetTime();
+        if (now - fps_window_t >= 2.0) {
+            const double rate = fps_count / (now - fps_window_t);
+            snprintf(fps_title, sizeof(fps_title), "sd-decoder dream %dx%d | %.2f img/s%s",
+                     window_width, window_height, rate,
+                     g_glfw_autoplay.load() ? " [PLAY]" : "");
+            glfwSetWindowTitle(window, fps_title);
+            fps_window_t = now;
+            fps_count    = 0;
+        }
+
+        glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(s_prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_tex);
+        glBindVertexArray(s_quad_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glfwSwapBuffers(window);
+    }
+
+    fprintf(stderr, "sd-decoder: dream window closed after %llu iteration(s)\n",
+            (unsigned long long)iteration);
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
+#endif  // SD_DECODER_HAS_GLFW
 
 int main(int argc, const char** argv) {
     Options opt;
@@ -290,12 +558,17 @@ int main(int argc, const char** argv) {
         return 1;
     }
 
+    // Decode the current latent_data. Returns the image (caller frees data).
+    auto decode_only = [&]() -> sd_image_t {
+        return sd_decode_latent(sd_ctx,
+                                latent_data.data(),
+                                latent_shape.data(),
+                                static_cast<int>(latent_shape.size()));
+    };
+
     // Decode latent_data and (over)write the output file. Returns true on success.
     auto decode_and_write = [&]() -> bool {
-        sd_image_t image = sd_decode_latent(sd_ctx,
-                                            latent_data.data(),
-                                            latent_shape.data(),
-                                            static_cast<int>(latent_shape.size()));
+        sd_image_t image = decode_only();
         if (image.width == 0 || image.data == nullptr) {
             fprintf(stderr, "sd-decoder: VAE decode failed\n");
             return false;
@@ -445,11 +718,23 @@ int main(int argc, const char** argv) {
             }
             fprintf(stderr, "sd-decoder: dream loop ended (%d iterations)\n", opt.iterations);
         } else {
-            // Interactive --loop: VAE stays loaded, each keypress = new dream image
-            // overwriting the output file; Ctrl-C winds the loop down gracefully.
+            // Interactive --loop: VAE stays loaded; a keypress generates a new dream
+            // image overwriting the output file.
             uint64_t fixed_seed = opt.seed;  // 0 = fresh entropy per keypress
-            uint64_t iteration  = 0;
             g_quit_interactive.store(false);
+#if SD_DECODER_HAS_GLFW
+            const int ret = glfw_dream_loop(static_cast<int>(opt.width),
+                                            static_cast<int>(opt.height),
+                                            fixed_seed,
+                                            build_random,
+                                            decode_only);
+            if (ret != 0) {
+                free_sd_ctx(sd_ctx);
+                return ret;
+            }
+#else
+            // Console fallback (build without GLFW): any stdin key = next dream.
+            uint64_t iteration = 0;
 #ifndef _WIN32
             struct sigaction sa;
             memset(&sa, 0, sizeof(sa));
@@ -465,11 +750,10 @@ int main(int argc, const char** argv) {
             }, TRUE);
 #endif
             fprintf(stderr,
-                    "sd-decoder: interactive dream mode - VAE loaded once, press any key for a new\n"
-                    "dream image (overwrites '%s'), Ctrl-C to quit.\n",
+                    "sd-decoder: dream mode (console) - press any key for a new dream image\n"
+                    "(overwrites '%s'), Ctrl-C to quit.\n",
                     opt.output_path.c_str());
-            const uint64_t limit = opt.iterations > 0 ? (uint64_t)opt.iterations : 0;  // 0 = until quit
-            while (!g_quit_interactive.load() && (limit == 0 || iteration < limit)) {
+            while (!g_quit_interactive.load()) {
 #ifdef _WIN32
                 if (!_kbhit()) {
                     Sleep(40);
@@ -493,6 +777,7 @@ int main(int argc, const char** argv) {
                 }
             }
             fprintf(stderr, "sd-decoder: dream loop ended (iteration %llu)\n", (unsigned long long)iteration);
+#endif  // SD_DECODER_HAS_GLFW
         }
     } else {
         fprintf(stderr, "sd-decoder: loaded %zu-element latent from '%s'\n",
